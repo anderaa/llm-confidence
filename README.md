@@ -30,36 +30,51 @@ Same calibration treatment runs on both signals downstream.
 
 ## Notebooks
 
-| Notebook | Model | Confidence scale | Notes |
-|---|---|---|---|
-| [`llm_conf_haiku_100.ipynb`](llm_conf_haiku_100.ipynb) | Claude Haiku 4.5 | 0–100 verbal | original baseline; introduces the equal-width-over-`[min,max]` binning and Wilson error bars |
-| [`llm_conf_haiku_10.ipynb`](llm_conf_haiku_10.ipynb) | Claude Haiku 4.5 | 0–10 verbal | does coarsening the scale change how the model distributes its self-assessment? |
-| [`llm_conf_sonnet_100.ipynb`](llm_conf_sonnet_100.ipynb) | Claude Sonnet 4.6 | 0–100 verbal | stronger-model comparison on the same task |
-| [`llm_conf_qwen_100.ipynb`](llm_conf_qwen_100.ipynb) | local (Llama 3.1 8B via MLX) | 0–100 verbal **and** logprobs | dual-signal — same model, same examples, both signals side-by-side. file is named after the original local-model attempt (Qwen3-30B-A3B); see "switching back" below |
+| Notebook | Model | Confidence scale | Accuracy | ECE | AUROC |
+|---|---|---|---:|---:|---:|
+| [`irony_haiku_100.ipynb`](irony_haiku_100.ipynb) | Claude Haiku 4.5 | 0–100 verbal | 0.756 | 0.094 | 0.655 |
+| [`irony_haiku_10.ipynb`](irony_haiku_10.ipynb) | Claude Haiku 4.5 | 0–10 verbal | 0.754 | 0.082 | 0.634 |
+| [`irony_sonnet_100.ipynb`](irony_sonnet_100.ipynb) | Claude Sonnet 4.6 | 0–100 verbal | 0.791 | 0.038 | 0.694 |
+| [`irony_llama_100.ipynb`](irony_llama_100.ipynb) | local Llama 3.1 8B via MLX (verbal) | 0–100 verbal | 0.642 | 0.159 | 0.526 |
+| [`irony_llama_100.ipynb`](irony_llama_100.ipynb) | local Llama 3.1 8B via MLX (logprob) | softmax over `{"0","1"}` | 0.639 | 0.104 | 0.634 |
 
-Result CSVs (`irony_<model>_<scale>.csv`) are written by each notebook and cached, so
-you can re-render plots without re-running inference.
+The local notebook produces both signals on the same examples in one pass through the
+data, so the verbal-vs-logprob comparison is apples-to-apples.
 
-## Findings so far
+Result CSVs (`data/irony_<model>_<scale>.csv`) are written by each notebook and cached,
+so re-running a notebook with the cache in place skips inference and just renders the
+plots. Delete the CSV to force a fresh run.
 
-- **Verbalized confidence clusters at a few round numbers.** Haiku 4.5 emitted 9
-  distinct values across 4,596 parsed responses; Sonnet 4.6 emitted 23. Equal-width
-  binning over `[0, 1]` wastes most of its bins on regions with no data — the
-  notebooks bin equal-width over `[min(conf), max(conf)]` instead, with quantile and
-  uniform binning available as alternatives.
-- **Stronger models are better calibrated and more discriminative, but not by much.**
-  Haiku 4.5: accuracy 0.756, ECE 0.094, AUROC 0.655. Sonnet 4.6: accuracy 0.791, ECE
-  0.038, AUROC 0.694. Both are overconfident at the top of their range; Sonnet less
-  so.
-- **Verbalized confidence can collapse to a constant.** The first local-model run
-  (Qwen3-30B-A3B-Instruct at 4-bit) emitted `95` as its verbalized confidence on every
-  single one of 500 examples — verbal AUROC = 0.500 by construction (a constant can't
-  rank anything). On the *same* model and the *same* examples, the logprob signal
-  reached AUROC 0.648. The verbalized number is a model artifact; what's actually in
-  the model's head lives in the token logits.
-- **Quantization on a 30B MoE bit hard.** Qwen3-30B-A3B at Q4 scored 0.548 accuracy
-  on irony — barely above the 0.49 base rate. Switching to dense Llama 3.1 8B
-  Instruct at the same quantization is the current direction.
+Shared logic — data loading, prompt templates, the JSON-response parser, the run loop,
+ECE / Wilson-interval / AUROC math, and the histogram + reliability plots — lives in
+[`calib.py`](calib.py). The notebooks contain the per-model configuration, narrative,
+and result rendering.
+
+## Findings
+
+- **Verbalized confidence clusters at a few round numbers, on every model tested.**
+  Haiku 4.5 on the 0–100 scale used 9 of the 100 possible values; on the 0–10 scale
+  it used 7 of 11. Sonnet 4.6 used 23 of 100. Llama 3.1 8B used 6 of 100 — and one
+  value (80) accounted for 94% of all responses. Equal-width binning over `[0, 1]`
+  wastes most of its bins on regions with no data; the notebooks bin equal-width over
+  `[min(conf), max(conf)]` instead, with quantile and uniform binning available as
+  alternatives.
+- **Coarsening the scale doesn't fix the clustering.** Haiku 0–100 → 0–10 produced
+  essentially the same headline numbers (accuracy 0.756 → 0.754, ECE 0.094 → 0.082,
+  AUROC 0.655 → 0.634). The model still concentrates its responses on a small subset
+  of the available values; reducing the alphabet from 100 to 11 just shrinks the
+  alphabet, not the model's habit of picking favorites.
+- **Stronger Claude models are better calibrated and more discriminative, modestly.**
+  Sonnet 4.6 vs Haiku 4.5 (both 0–100): accuracy 0.791 vs 0.756, ECE 0.038 vs 0.094,
+  AUROC 0.694 vs 0.655. The Sonnet calibration curve is also closer to the 45° line
+  throughout its populated range.
+- **Verbalized confidence is much weaker than logprobs on the open model.** Llama 3.1
+  8B's verbalized AUROC (0.526) is barely above chance — the 94%-at-80 collapse means
+  the signal can't rank correct above incorrect predictions. The logprob signal on
+  the same model, same examples reaches AUROC 0.634 (comparable to Haiku's verbalized
+  AUROC) and a notably better ECE (0.104 vs 0.159). The verbalized number on this
+  model is a token-emission artifact; what's actually in the model's head lives in
+  the next-token logits, and it's a real signal worth using.
 
 ## Setup
 
