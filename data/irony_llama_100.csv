@@ -1,4 +1,4 @@
-text,true_label,pred_verbal,conf_verbal,correct_verbal,pred_logprob,conf_logprob,correct_logprob
+text,true_label,pred_verbal,conf_verbal,correct_verbal,pred_prob,conf_prob,correct_prob
 I'm so glad I'm sick today. | #bullcrap,1,1,0.9,1,1,0.7685546875,1
 @user Is it snowing in Canada? Just on the hills here at the minute but hoping for a white Christmas,0,0,0.8,1,0,0.56982421875,1
 @user Definitely not...racism is systematic and entrenched in every American institution..also in black/white binary construction,0,1,0.8,0,0,0.93505859375,1

@@ -80,11 +80,30 @@ def verbalized_system_prompt(scale: int = 100) -> str:
     )
 
 
-LOGPROB_SYSTEM = (
+PROB_SYSTEM = (
     f"You judge whether tweets are ironic. {IRONY_RUBRIC} "
     "Respond with EXACTLY ONE CHARACTER: '1' if the tweet is ironic, '0' if it is not. "
     "No other text, no quotes, no explanation."
 )
+
+
+def prob_ironic_system_prompt(scale: int = 100) -> str:
+    """System prompt asking for `P(text is ironic)` directly, without a label step.
+
+    Different from :func:`verbalized_system_prompt`: that one asks for label +
+    confidence-in-label as two fields; this one asks for one number — the
+    probability the tweet is ironic. The downstream parser thresholds at 0.5 to
+    derive the implied label.
+
+    :param scale: Top of the probability range; the model emits an integer in
+        ``[0, scale]``. Typically 10 or 100.
+    """
+    return (
+        f"You judge whether tweets are ironic. {IRONY_RUBRIC} "
+        f"Respond with ONLY a JSON object and nothing else, in the form "
+        f'{{"prob_ironic": <integer 0-{scale} = your estimated probability '
+        f"that the tweet is ironic>}}."
+    )
 
 
 # parsing -------------------------------------------------------------------
@@ -115,10 +134,58 @@ def parse_verbalized_response(body: str, scale: int = 100) -> tuple[int | None, 
     return label, conf
 
 
+def parse_prob_ironic_response(body: str, scale: int = 100) -> tuple[int | None, float | None]:
+    """Parse a json ``{"prob_ironic": int}`` response into (label, confidence).
+
+    The label is derived from the probability — 1 if ``P(ironic) >= 0.5`` else 0.
+    Confidence in the chosen label is ``max(p, 1-p)``, so the returned shape
+    matches what :func:`parse_verbalized_response` produces and slots straight
+    into the same downstream pipeline.
+
+    The mapping is lossless: ``P(ironic) = conf if label == 1 else 1 - conf``,
+    so the raw probability can always be recovered from a cached row.
+
+    :param body: Raw model response text.
+    :param scale: The same scale the model was asked for; divides the integer
+        to land in [0, 1].
+    :returns: Tuple ``(label, conf)`` with label in {0, 1} and conf in
+        ``[0.5, 1]``, or ``(None, None)`` if the response is unparseable or out
+        of range.
+    """
+    match = _json_re.search(body)
+    if not match:
+        return None, None
+    try:
+        obj = json.loads(match.group(0))
+        p = float(obj["prob_ironic"]) / scale
+    except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+        return None, None
+    if not (0.0 <= p <= 1.0):
+        return None, None
+    label = 1 if p >= 0.5 else 0
+    conf = p if label == 1 else (1 - p)
+    return label, conf
+
+
 # anthropic helper ----------------------------------------------------------
+
+# opus 4.7 and 4.8 dropped sampling parameters — sending temperature/top_p/top_k
+# returns a 400 immediately. earlier opus + every haiku and sonnet still accept
+# them. keep this list in sync with the model-migration breaking-change notes.
+_NO_SAMPLING_PARAMS = ("opus-4-7", "opus-4-8")
+
+
+def _accepts_temperature(model_id: str) -> bool:
+    """Whether `model_id` still accepts the `temperature` request parameter."""
+    return not any(tag in model_id for tag in _NO_SAMPLING_PARAMS)
+
 
 def make_anthropic_classifier(client, model: str, scale: int = 100, max_retries: int = 3):
     """Build a callable that classifies one text via the anthropic messages api.
+
+    Automatically omits the ``temperature`` parameter for models that reject it
+    (currently Opus 4.7 and 4.8) — without this, every call 400s before billing
+    and looks like a silent stall.
 
     :param client: An `anthropic.Anthropic` instance.
     :param model: Model id string (e.g. ``"claude-haiku-4-5-20251001"``).
@@ -129,20 +196,58 @@ def make_anthropic_classifier(client, model: str, scale: int = 100, max_retries:
         for passing to :func:`run_loop`.
     """
     system = verbalized_system_prompt(scale)
+    kwargs: dict = {"model": model, "max_tokens": 40, "system": system}
+    if _accepts_temperature(model):
+        kwargs["temperature"] = 0
 
     def classify(text: str) -> tuple[int | None, float | None]:
         for attempt in range(max_retries):
             try:
                 resp = client.messages.create(
-                    model=model,
-                    max_tokens=40,
-                    temperature=0,
-                    system=system,
                     messages=[{"role": "user", "content": text}],
+                    **kwargs,
                 )
                 return parse_verbalized_response(resp.content[0].text, scale=scale)
             except Exception:
                 # back off briefly on rate limits / transient errors
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+        return None, None
+
+    return classify
+
+
+def make_anthropic_prob_ironic_classifier(
+    client, model: str, scale: int = 100, max_retries: int = 3
+):
+    """Like :func:`make_anthropic_classifier`, but asks for ``P(ironic)`` directly.
+
+    The model isn't asked for a label *and* a confidence — instead it returns
+    one number, its estimated probability that the text is ironic. The implied
+    label and the confidence-in-chosen-label are derived in the parser so the
+    returned shape matches the verbalized classifier and slots into
+    :func:`run_loop` / :func:`run_or_load` unchanged.
+
+    :param client: An `anthropic.Anthropic` instance.
+    :param model: Model id string (e.g. ``"claude-sonnet-4-6"``).
+    :param scale: Top of the probability range (10 or 100).
+    :param max_retries: Retries on transient api / parse failures.
+    :returns: A function ``(text) -> (label, conf) | (None, None)``.
+    """
+    system = prob_ironic_system_prompt(scale)
+    kwargs: dict = {"model": model, "max_tokens": 40, "system": system}
+    if _accepts_temperature(model):
+        kwargs["temperature"] = 0
+
+    def classify(text: str) -> tuple[int | None, float | None]:
+        for attempt in range(max_retries):
+            try:
+                resp = client.messages.create(
+                    messages=[{"role": "user", "content": text}],
+                    **kwargs,
+                )
+                return parse_prob_ironic_response(resp.content[0].text, scale=scale)
+            except Exception:
                 if attempt < max_retries - 1:
                     time.sleep(2 ** attempt)
         return None, None
@@ -165,7 +270,7 @@ def run_loop(
 
     :param samples: List of `{text, label}` dicts (from :func:`subsample`).
     :param classifiers: Dict mapping signal name (e.g. ``"verbal"``,
-        ``"logprob"``) to a classifier callable.
+        ``"prob"``) to a classifier callable.
     :param csv_path: Where to cache the per-row results.
     :param progress_every: Print a progress line every n examples.
     :returns: Tuple ``(results_rows, signals_dict)``. `signals_dict` maps each
@@ -173,22 +278,28 @@ def run_loop(
         metrics and plotting.
     """
     results: list[dict] = []
+    failures = 0
     t_start = time.time()
     for i, ex in enumerate(samples):
         outputs = {name: fn(ex["text"]) for name, fn in classifiers.items()}
         # apples-to-apples: drop the row entirely if any signal failed to parse
         if any(pred is None for pred, _ in outputs.values()):
-            continue
-        row = {"text": ex["text"], "true_label": ex["label"]}
-        for name, (pred, conf) in outputs.items():
-            row[f"pred_{name}"] = pred
-            row[f"conf_{name}"] = conf
-            row[f"correct_{name}"] = int(pred == ex["label"])
-        results.append(row)
+            failures += 1
+        else:
+            row = {"text": ex["text"], "true_label": ex["label"]}
+            for name, (pred, conf) in outputs.items():
+                row[f"pred_{name}"] = pred
+                row[f"conf_{name}"] = conf
+                row[f"correct_{name}"] = int(pred == ex["label"])
+            results.append(row)
+        # progress fires unconditionally — surfaces a stuck/failing run instead
+        # of going silent when every call returns (None, None)
         if (i + 1) % progress_every == 0:
             rate = (i + 1) / (time.time() - t_start)
             eta_min = (len(samples) - (i + 1)) / rate / 60
-            print(f"{i + 1}/{len(samples)} done  ({rate:.2f} ex/s, eta {eta_min:.1f} min)")
+            fail_note = f", {failures} failures" if failures else ""
+            print(f"{i + 1}/{len(samples)} done  "
+                  f"({rate:.2f} ex/s, eta {eta_min:.1f} min{fail_note})")
 
     print(f"\nparsed {len(results)} / {len(samples)} responses "
           f"in {(time.time() - t_start) / 60:.1f} min")
@@ -535,7 +646,15 @@ def plot_reliability(
         valid = ~np.isnan(acc)
         if not valid.any():
             continue
-        yerr = np.vstack([acc - lowers, uppers - acc])
+        # wilson intervals are centered on (p + z²/2n)/(1 + z²/n), not on p, so
+        # at acc=1.0 the upper bound can fall below the empirical point and at
+        # acc=0.0 the lower bound can sit above it. clipping to nonneg keeps
+        # matplotlib happy and visually collapses the offending whisker — the
+        # useful direction at the boundary is the other one anyway.
+        yerr = np.vstack([
+            np.maximum(acc - lowers, 0.0),
+            np.maximum(uppers - acc, 0.0),
+        ])
         label = f"{name} (ECE = {m['ece']:.3f}, AUROC = {m['auroc']:.3f})"
         ax.errorbar(
             mean_conf[valid], acc[valid], yerr=yerr[:, valid],

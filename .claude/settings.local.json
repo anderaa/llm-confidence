@@ -5,7 +5,8 @@
       "Skill(claude-api:*)",
       "Bash(git mv *)",
       "Bash(python -c \"import calib; print\\('ok'\\); print\\([n for n in dir\\(calib\\) if not n.startswith\\('_'\\)]\\)\")",
-      "Bash(/Users/aaron/.pyenv/versions/llm_confidence/bin/python -c \"import calib; print\\('ok'\\)\")"
+      "Bash(/Users/aaron/.pyenv/versions/llm_confidence/bin/python -c \"import calib; print\\('ok'\\)\")",
+      "Bash(/Users/aaron/.pyenv/versions/llm_confidence/bin/python)"
     ]
   }
 }
