@@ -262,7 +262,7 @@ def run_loop(
     classifiers: dict[str, Callable[[str], tuple[int | None, float | None]]],
     csv_path: str,
     progress_every: int = 100,
-) -> tuple[list[dict], dict[str, tuple[np.ndarray, np.ndarray]]]:
+) -> tuple[list[dict], dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]]:
     """Run one or more classifiers over a sample list, write results to csv.
 
     Only keeps rows where every classifier produced a parseable response, so
@@ -316,13 +316,14 @@ def run_loop(
         name: (
             np.array([r[f"conf_{name}"] for r in results]),
             np.array([r[f"correct_{name}"] for r in results]),
+            np.array([r[f"pred_{name}"] for r in results]),
         )
         for name in classifiers
     }
     return results, signals
 
 
-def _load_results(csv_path: str) -> tuple[list[dict], dict[str, tuple[np.ndarray, np.ndarray]]]:
+def _load_results(csv_path: str) -> tuple[list[dict], dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]]:
     """Read a cached run-loop csv back into the same `(results, signals)` shape.
 
     Handles two on-disk schemas: the post-refactor multi-signal layout
@@ -357,6 +358,7 @@ def _load_results(csv_path: str) -> tuple[list[dict], dict[str, tuple[np.ndarray
         name: (
             np.array([r[f"conf_{name}"] for r in results]),
             np.array([r[f"correct_{name}"] for r in results]),
+            np.array([r[f"pred_{name}"] for r in results]),
         )
         for name in signal_names
     }
@@ -368,7 +370,7 @@ def run_or_load(
     classifiers: dict[str, Callable[[str], tuple[int | None, float | None]]],
     csv_path: str,
     progress_every: int = 100,
-) -> tuple[list[dict], dict[str, tuple[np.ndarray, np.ndarray]]]:
+) -> tuple[list[dict], dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]]:
     """Skip inference if a cached results csv already exists.
 
     If ``csv_path`` exists, load it and return immediately — `samples` and
@@ -482,52 +484,90 @@ def wilson_interval(k: float, n: int, z: float = 1.96) -> tuple[float, float]:
     return center - half, center + half
 
 
-def auroc(conf: np.ndarray, correct: np.ndarray) -> float:
-    """AUROC of confidence vs correctness; nan if only one correctness class present."""
-    if len(np.unique(correct)) < 2:
+def auroc(scores: np.ndarray, labels: np.ndarray) -> float:
+    """AUROC of `scores` against binary `labels`; nan if `labels` has only one class.
+
+    Standard sklearn ordering: scores are continuous, labels are 0/1. Returns
+    ``roc_auc_score(labels, scores)``.
+    """
+    if len(np.unique(labels)) < 2:
         return float("nan")
-    return roc_auc_score(correct, conf)
+    return roc_auc_score(labels, scores)
 
 
 def compute_metrics(
-    signals: dict[str, tuple[np.ndarray, np.ndarray]],
+    signals: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]],
     n_bins: int = 30,
     strategy: str = "range",
 ) -> dict[str, dict]:
-    """Compute accuracy / ECE / AUROC / per-bin stats for each named signal.
+    """Compute accuracy / ECE / two AUROCs / per-bin stats for each named signal.
 
-    :param signals: Dict of ``{name: (confidences, correct)}``.
+    Two flavors of AUROC are computed and stored under different keys:
+
+    - ``calibration_auroc`` — ``AUROC(scores=conf, labels=correct)``. Asks
+      whether higher confidence-in-chosen-label ranks correct predictions above
+      incorrect ones. This is the introspection / self-assessment metric.
+    - ``classifier_auroc`` — ``AUROC(scores=P(class=1), labels=true_label)``.
+      Asks whether the predicted probability of class 1 ranks actual-positives
+      above actual-negatives. This is the standard "is this a good classifier"
+      metric.
+
+    Both rely on the convention that confidence is confidence-in-chosen-label,
+    so ``P(class=1) = conf if pred == 1 else 1 - conf`` and (for binary)
+    ``true_label = pred if correct == 1 else 1 - pred``. Both reconstructions
+    are stored in the output for further analysis.
+
+    :param signals: Dict of ``{name: (confidences, correct, pred)}``.
     :param n_bins: Forwarded to :func:`expected_calibration_error`.
     :param strategy: Forwarded to :func:`expected_calibration_error`.
     :returns: Dict mapping signal name to a dict with keys `conf`, `correct`,
-        `accuracy`, `ece`, `auroc`, `stats`.
+        `pred`, `p_class_1`, `true_label`, `accuracy`, `ece`,
+        `calibration_auroc`, `classifier_auroc`, `stats`.
     """
     out = {}
-    for name, (conf, correct) in signals.items():
+    for name, (conf, correct, pred) in signals.items():
         ece, stats = expected_calibration_error(conf, correct, n_bins=n_bins, strategy=strategy)
+        # reconstruct directional probability and ground-truth label from the
+        # confidence-in-chosen-label convention
+        p_class_1 = np.where(pred == 1, conf, 1 - conf)
+        true_label = np.where(correct == 1, pred, 1 - pred)
         out[name] = {
             "conf": conf,
             "correct": correct,
+            "pred": pred,
+            "p_class_1": p_class_1,
+            "true_label": true_label,
             "accuracy": float(correct.mean()),
             "ece": ece,
-            "auroc": auroc(conf, correct),
+            "calibration_auroc": auroc(conf, correct),
+            "classifier_auroc": auroc(p_class_1, true_label),
             "stats": stats,
         }
     return out
 
 
 def print_metrics(metrics: dict[str, dict]) -> None:
-    """Print accuracy / ECE / AUROC in a comparable column layout.
+    """Print accuracy / ECE / both AUROCs in a comparable column layout.
 
     Works for one signal or many; columns auto-size to fit the longest name.
+    Both AUROCs are printed — `calibration_auroc` measures self-assessment
+    (does confidence track correctness?) and `classifier_auroc` measures
+    classification quality (does P(class=1) discriminate positives from
+    negatives?). The two can diverge meaningfully — see :func:`compute_metrics`.
     """
     names = list(metrics.keys())
     col_width = max(12, max(len(n) for n in names) + 2)
+    label_width = 22
     header = "".join(f"{n:>{col_width}}" for n in names)
-    print(f"{'':14}{header}")
-    for label, key in [("accuracy:", "accuracy"), ("ECE:", "ece"), ("AUROC:", "auroc")]:
+    print(f"{'':{label_width}}{header}")
+    for label, key in [
+        ("accuracy:", "accuracy"),
+        ("ECE:", "ece"),
+        ("calibration AUROC:", "calibration_auroc"),
+        ("classifier AUROC:", "classifier_auroc"),
+    ]:
         row = "".join(f"{metrics[n][key]:>{col_width}.3f}" for n in names)
-        print(f"{label:14}{row}")
+        print(f"{label:{label_width}}{row}")
     print()
     for name in names:
         edges = metrics[name]["stats"]["edges"]
@@ -655,7 +695,10 @@ def plot_reliability(
             np.maximum(acc - lowers, 0.0),
             np.maximum(uppers - acc, 0.0),
         ])
-        label = f"{name} (ECE = {m['ece']:.3f}, AUROC = {m['auroc']:.3f})"
+        # the reliability diagram visualizes calibration, so the calibration
+        # auroc is the relevant one in the legend (classifier auroc is in
+        # print_metrics for classifier-quality comparison)
+        label = f"{name} (ECE = {m['ece']:.3f}, AUROC = {m['calibration_auroc']:.3f})"
         ax.errorbar(
             mean_conf[valid], acc[valid], yerr=yerr[:, valid],
             fmt=fmts[i % len(fmts)], capsize=3, ecolor="lightgray",
