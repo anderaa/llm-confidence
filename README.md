@@ -36,20 +36,46 @@ diagram, AUROC, histogram code.
 
 ## Two AUROC flavors
 
-For each (model, signal) pair the notebooks report two AUROCs:
+A quick refresher on what AUROC measures, since both flavors below build on it: give
+AUROC a pile of examples, each with a numeric score and a yes/no label, and it asks
+"if I picked one yes-example and one no-example at random, how often does the
+yes-example get the higher score?" That fraction is the AUROC. 1.0 means the score
+perfectly separates the two groups (every yes outscores every no); 0.5 means the score
+is no better than a coin flip; under 0.5 means the score is ranking things backwards.
+Crucially, AUROC only cares about *relative ranking*, not the actual score values — so
+it's a clean way to ask "does this number contain useful signal about that label?"
+without worrying about whether the number is calibrated to mean anything in absolute
+terms.
 
-- **Calibration AUROC** — `AUROC(scores=conf, labels=correct)`. Asks "does the model's
-  stated confidence rank its correct predictions above its incorrect ones?" The
-  standard quantity for evaluating calibration / selective prediction.
-- **Classifier AUROC** — `AUROC(scores=P(class=1), labels=true_label)`. Reconstructs
-  `P(class=1) = conf if pred == 1 else 1 - conf` and treats the system as a standard
-  binary classifier. Decoupled from the model's self-assessment; this is the metric
-  you'd use to compare against any other classifier on this task.
+The two flavors below feed AUROC completely different scores and labels — they're
+asking two different yes/no questions about the same run:
+
+- **Calibration AUROC** — `AUROC(scores=conf, labels=correct)`. The yes/no label here
+  is "did the model get this example right?", and the score is the model's own stated
+  confidence. So this AUROC asks: *across all the examples, does the model's confidence
+  tend to be higher on the ones it gets right than on the ones it gets wrong?* A model
+  that "knows what it doesn't know" — that hedges on hard examples and commits on easy
+  ones — scores high here, regardless of how good it is at the underlying task. This is
+  the standard quantity for evaluating calibration / selective prediction (i.e. "should
+  I trust this prediction enough to act on it, or send it for human review?").
+- **Classifier AUROC** — `AUROC(scores=P(class=1), labels=true_label)`. Forget
+  confidence and correctness entirely — this one throws away the model's self-assessment
+  and re-scores each example as a plain binary classifier would: `P(class=1) = conf if
+  pred == 1 else 1 - conf` turns "I said ironic with 80% confidence" into `P(ironic) =
+  0.8` and "I said literal with 80% confidence" into `P(ironic) = 0.2`, on the same
+  0–1 scale regardless of which label the model picked. The yes/no label is now "is
+  this tweet actually ironic?", so the question becomes: *does this reconstructed
+  probability rank the truly-ironic tweets above the truly-literal ones?* This is the
+  number you'd put next to any other irony classifier's AUROC for an apples-to-apples
+  comparison — it has nothing to do with whether the model can introspect on its own
+  correctness.
 
 Classifier AUROC is uniformly higher than calibration AUROC across all runs (roughly
-+0.15) — telling correct from incorrect is a strictly harder problem than telling
-class 1 from class 0, and a model can be a strong classifier while still being a
-mediocre judge of its own correctness.
++0.15). That gap makes sense once you see the two questions side by side: "is this
+tweet ironic?" is the task the model was tuned and prompted for, while "was *I* right
+just now?" is a harder, second-order question the model was never directly optimized
+to answer. A model can be a strong classifier — good at the first question — while
+still being a mediocre judge of its own correctness — weak at the second.
 
 ## Notebooks
 
