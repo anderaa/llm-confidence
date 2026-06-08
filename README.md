@@ -34,6 +34,34 @@ correct and wrong predictions, even for strong models.
 All three signals get the same calibration treatment downstream — same ECE, reliability
 diagram, AUROC, histogram code.
 
+## ECE
+
+**Expected Calibration Error** asks a simpler, more literal question than AUROC does:
+"when the model says it's 80% confident, is it actually right about 80% of the time?"
+
+To measure this, bucket the examples by their stated confidence (e.g. all the times
+the model said "70-80% confident" go in one bucket), then within each bucket compare
+two numbers: the average confidence the model claimed, and the fraction of examples in
+that bucket it actually got right. A perfectly calibrated model has those two numbers
+match in every bucket — its 80%-confidence bucket really is right 80% of the time, its
+60%-confidence bucket really is right 60% of the time, and so on. ECE is the average
+gap between claimed-confidence and actual-accuracy across all the buckets, weighted by
+how many examples fall in each one. So ECE is in the same units as confidence and
+accuracy — `0.0` is perfect calibration, and `0.094` (Haiku's JSON-prompt run, say)
+means the model's stated confidence is off by about 9.4 percentage points from its
+real accuracy, on average across the confidence range it actually used.
+
+Note what ECE does *not* care about: it has no opinion on whether the model gets the
+underlying classification right, and — unlike calibration AUROC — no opinion on
+whether confidence successfully separates correct from incorrect predictions either.
+A model that says "60% confident" on every single example, and is in fact right 60%
+of the time overall, scores a perfect ECE of `0.0` despite that confidence number
+carrying zero example-by-example information (calibration AUROC would correctly call
+this out as useless, at `0.5`). ECE and calibration AUROC are answering related but
+distinct questions — "are the numbers honest on average?" vs. "do the numbers
+discriminate between right and wrong?" — and a model can do well on one while doing
+poorly on the other.
+
 ## Two AUROC flavors
 
 A quick refresher on what AUROC measures, since both flavors below build on it: give
